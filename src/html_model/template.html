@@ -384,12 +384,6 @@ code { font-family: var(--font-num); font-size: .92em; }
         `<tr><td>${MODEL.chosen}</td><td class="num">${r3(V.prob["Brier"])}</td><td class="num">${r3(V.prob["로그손실"])}</td><td class="num">${r3(V.prob["ECE"])}</td><td class="num">${r3(V.prob["AUC"])}</td></tr></tbody>`;
     }
     const items = [];
-    const RP = V.repeated;
-    if (RP) {
-      const one = (k) => RP[k] ? `R² <b>${r3(RP[k]["R²"].mean)} ± ${r3(RP[k]["R²"].std)}</b> (95% 범위 ${r3(RP[k]["R²"].lo)}~${r3(RP[k]["R²"].hi)}), MAE <b>${r2(RP[k]["MAE(MPa)"].mean)}</b> MPa, ±5 MPa 이내 <b>${fmt(100 * RP[k]["±5 MPa 이내"].mean)}%</b>` : "–";
-      items.push(`<b>반복 무작위 7:3 검증</b> (중복 ${RP.removed_exact}건·강도 충돌 ${RP.removed_conflict}행 제외한 ${RP.rows}건, ${RP.n}회): ${one("무작위")}`);
-      items.push(`같은 방식, 배합 기준 7:3 (처음 보는 배합만 검증): ${one("배합 기준")}`);
-    }
     if (V.cv) items.push(`반복 그룹 교차검증 (${V.cv.runs}회): R² <b>${r3(V.cv["R²"].mean)} ± ${r3(V.cv["R²"].std)}</b>, RMSE <b>${r2(V.cv["RMSE(MPa)"].mean)} ± ${r2(V.cv["RMSE(MPa)"].std)}</b> MPa`);
     if (V.ci) items.push(`테스트 R² 95% 신뢰구간: <b>${r3(V.ci["R²"][0])} ~ ${r3(V.ci["R²"][1])}</b> (배합 단위 부트스트랩)`);
     if (V.train && V.test) items.push(`과적합 확인: 학습 R² <b>${r3(V.train["R²"])}</b> vs 테스트 <b>${r3(V.test["R²"])}</b>`);

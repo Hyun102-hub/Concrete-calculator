@@ -31,7 +31,6 @@ TEST_SIZE = 0.30
 FAST_MODE = True          # True: 축소 탐색 / False: 전체 탐색 + 중첩 교차검증 (오래 걸림)
 CV_REPEATS = 3            # 반복 그룹 교차검증 반복 횟수 (5겹 × 반복)
 N_BOOT = 1000             # 부트스트랩 반복 횟수
-N_REPEAT = 100            # ⑧ 반복 무작위 7:3 검증 횟수
 EVAL_TARGETS = [21, 24, 27, 30, 35, 40]
 LOG_AGE = True            # True: 재령에 로그를 씌워 넣음 (초기에 빨리, 나중에 천천히 오르는 강도 특성을 학습하기 쉬움) / False: 그대로
 """)
@@ -226,7 +225,6 @@ md(r"""
 | ⑤ | 확률 보정 확인 | "80%"라고 한 배합이 실제로 80% 달성하는지 |
 | ⑥ | 물리적 타당성 | 물을 늘리면 강도가 내려가는 등 공학 상식과 맞는지 |
 | ⑦ | 중첩 교차검증 (`FAST_MODE = False`) | 설정 고르기까지 포함한 성능을 편향 없이 추정 |
-| **⑧** | **반복 무작위 7:3 검증** (중복·충돌 데이터 제외) | 데이터를 무작위로 7:3으로 나눠 학습·검증하는 과정을 여러 번 반복했을 때 예측이 실제와 얼마나 비슷한지 |
 """)
 
 md("## ① 테스트 평가와 기준 모델 비교")
@@ -447,61 +445,6 @@ print(f"테스트 배합 {len(base28)}개 기준"); display(phys)
 """)
 
 md(r"""
-## ⑧ 반복 무작위 7:3 검증 (중복·충돌 데이터 제외)
-
-1. 원자료에서 **완전히 같은 행**(배합·재령·강도 동일)은 하나만 남기고, **배합·재령이 같은데 강도가 다른 행**은 어느 값이 맞는지 알 수 없으므로 모두 뺍니다.
-2. 남은 데이터를 **무작위로 7:3**으로 나눕니다.
-3. 7로 이 모델(4번에서 고른 구조·설정 그대로)을 학습하고, 3의 배합·재령을 넣어 나온 예측값을 실제 강도와 비교합니다.
-4. 2~3을 `N_REPEAT`번 반복해 성능의 평균과 범위를 봅니다.
-
-비교로 같은 과정을 **배합 기준 7:3 분할**로도 반복합니다. 무작위로 나누면 같은 배합의 다른 재령이 학습·검증에 함께 들어갈 수 있어서, 배합 기준 분할이 '완전히 새로운 배합'에 더 가까운 조건입니다.
-""")
-code(r"""
-d0 = raw.copy()
-n_exact = int(d0.duplicated().sum())
-d1 = d0.drop_duplicates().reset_index(drop=True)
-conflict = d1.duplicated(subset=FEATURES, keep=False)
-n_conf_rows, n_conf_groups = int(conflict.sum()), int(d1[conflict].groupby(FEATURES).ngroups)
-dc = d1[~conflict].reset_index(drop=True)
-dc["배합번호"] = dc.groupby(MATERIALS).ngroup() + 1
-print(f"원자료 {len(d0)}건 → 완전 중복 {n_exact}건 제외 → 배합·재령이 같고 강도가 다른 {n_conf_rows}행({n_conf_groups}조건) 제외 → "
-      f"검증용 데이터 {len(dc)}건 (배합 {dc['배합번호'].nunique()}개)")
-
-
-def one_run(seed, scheme):
-    if scheme == "무작위":
-        a, b = train_test_split(np.arange(len(dc)), test_size=0.3, random_state=seed)
-    else:
-        a, b = next(GroupShuffleSplit(1, test_size=0.3, random_state=seed).split(dc, groups=dc["배합번호"]))
-    m = clone(REG).set_params(mlp__random_state=seed).fit(dc.iloc[a][FEATURES], dc.iloc[a]["압축강도"])
-    yt, pt_ = dc.iloc[b]["압축강도"].values, m.predict(dc.iloc[b][FEATURES])
-    e = pt_ - yt
-    return {"방식": scheme, "회차": seed + 1, "학습 건수": len(a), "검증 건수": len(b), **rscore(yt, pt_),
-            "±5 MPa 이내": np.mean(np.abs(e) <= 5), "±10 MPa 이내": np.mean(np.abs(e) <= 10),
-            "상대오차 중앙값": np.median(np.abs(e) / yt), "평균 편향(MPa)": e.mean(),
-            "학습 R²": r2_score(dc.iloc[a]["압축강도"], m.predict(dc.iloc[a][FEATURES]))}
-
-
-runs = Parallel(n_jobs=-1)(delayed(one_run)(s_, sch) for sch in ["무작위", "배합 기준"] for s_ in range(N_REPEAT))
-rep = pd.DataFrame(runs)
-mcols = ["R²", "MAE(MPa)", "RMSE(MPa)", "±5 MPa 이내", "±10 MPa 이내", "상대오차 중앙값", "평균 편향(MPa)", "학습 R²"]
-summ = rep.groupby("방식")[mcols].agg(["mean", "std", lambda x: x.quantile(0.025), lambda x: x.quantile(0.975), "min", "max"])
-summ.columns = pd.MultiIndex.from_tuples([(c, {"mean": "평균", "std": "표준편차", "<lambda_0>": "2.5%", "<lambda_1>": "97.5%", "min": "최소", "max": "최대"}[f]) for c, f in summ.columns])
-for sch in ["무작위", "배합 기준"]:
-    t = summ.loc[sch].unstack().round(3)
-    print(f"[{sch} 7:3 분할 × {N_REPEAT}회] 학습 {int(rep[rep['방식'] == sch]['학습 건수'].mean())}건 / 검증 {int(rep[rep['방식'] == sch]['검증 건수'].mean())}건 (평균)")
-    display(t)
-
-fig, ax = plt.subplots(1, 2, figsize=(12, 3.8))
-for i, (col, lab) in enumerate([("R²", "검증 R²"), ("MAE(MPa)", "검증 MAE (MPa)")]):
-    for sch, c in [("무작위", "#2a78d6"), ("배합 기준", "#eb6834")]:
-        ax[i].hist(rep[rep["방식"] == sch][col], bins=20, alpha=0.6, color=c, label=f"{sch} 7:3")
-    ax[i].set_xlabel(lab); ax[i].set_ylabel("반복 횟수"); ax[i].legend(fontsize=8)
-ax[0].set_title(f"{N_REPEAT}회 반복한 검증 R² 분포"); ax[1].set_title(f"{N_REPEAT}회 반복한 검증 MAE 분포")
-plt.tight_layout(); plt.show()
-""")
-
-md(r"""
 ## ⑦ 중첩 교차검증 (`FAST_MODE = False`일 때만)
 
 바깥 5겹(배합 기준)마다 안쪽 교차검증으로 설정을 **새로 고른 뒤** 바깥 묶음으로 평가합니다. 설정 고르기까지 포함한 성능이라 가장 엄격한 추정입니다.
@@ -619,10 +562,6 @@ export = {
         "within5": pct(np.mean(np.abs(err) <= 5)), "within10": pct(np.mean(np.abs(err) <= 10)),
         "phys": phys.to_dict("records"),
         "formula_diff": {k: pct(v) for k, v in fdiff.iloc[0].items()},
-        "repeated": {"n": int(N_REPEAT), "rows": int(len(dc)), "removed_exact": n_exact, "removed_conflict": n_conf_rows,
-                     **{sch: {c: {"mean": pct(rep[rep["방식"] == sch][c].mean()), "std": pct(rep[rep["방식"] == sch][c].std()),
-                                  "lo": pct(rep[rep["방식"] == sch][c].quantile(0.025)), "hi": pct(rep[rep["방식"] == sch][c].quantile(0.975))}
-                              for c in ["R²", "MAE(MPa)", "RMSE(MPa)", "±5 MPa 이내", "±10 MPa 이내"]} for sch in ["무작위", "배합 기준"]}},
     },
     "checks": [{"mix": {k: v for k, v in e.items() if k in MATERIALS}, "target": e["목표강도"], "age": 28,
                 "p": float(prob(float(REG.predict(pd.DataFrame([{**{k: e[k] for k in MATERIALS}, "재령": 28.0}])[FEATURES])[0]), 28, e["목표강도"])[0, 0])}
