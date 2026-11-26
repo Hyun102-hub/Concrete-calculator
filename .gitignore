@@ -1,0 +1,5 @@
+src/public/
+src/html_model/concrete_probability.html
+src/콘크리트_목표강도_확률_계산기.html
+__pycache__/
+*.joblib
