@@ -1,5 +1,5 @@
-// 콘크리트 목표 강도 달성 확률 — 브라우저 계산 코어
-// Colab 노트북의 model_export.json과 같은 계산을 한다 (MinMaxScaler → MLP → 확률)
+// 콘크리트 목표 강도 달성 확률 — 브라우저 계산 코어 (모델 v2: ANN 단독 예측, 공식은 비교용)
+// Colab 노트북 concrete_ann_prob.ipynb 가 만든 model_export.json 과 같은 계산을 한다
 (function (root) {
   "use strict";
   const MATERIALS = ["시멘트", "고로슬래그", "플라이애시", "물", "고성능감수제", "굵은골재", "잔골재"];
@@ -11,27 +11,14 @@
     return s * y;
   }
   const normCdf = (z) => 0.5 * (1 + erf(z / Math.SQRT2));
-  const logit = (p) => { p = Math.min(Math.max(p, 1e-6), 1 - 1e-6); return Math.log(p / (1 - p)); };
-  const expit = (z) => 1 / (1 + Math.exp(-z));
-  const ACT = {
-    relu: (v) => Math.max(0, v), tanh: Math.tanh, logistic: expit, identity: (v) => v,
-  };
-
+  const ACT = { relu: (v) => Math.max(0, v), tanh: Math.tanh, logistic: (v) => 1 / (1 + Math.exp(-v)), identity: (v) => v };
   const ageFactor = (t) => t / (4.0 + 0.85 * t);
 
-  function features(mix, age, model) {
-    const binder = mix["시멘트"] + mix["고로슬래그"] + mix["플라이애시"];
-    const wb = mix["물"] / binder;
-    const f = {
-      ...mix, "재령": age, "결합재": binder, "W/C": mix["물"] / mix["시멘트"], "W/B": wb,
-      "재령계수": ageFactor(age),
-    };
-    f["공식강도"] = model.formula.A / Math.pow(model.formula.B, wb) * ageFactor(age) / ageFactor(28);
-    return f;
-  }
-
-  function mlp(net, feat) {
-    let h = net.features.map((k, i) => feat[k] * net.scale[i] + net.min[i]);
+  // ANN: 입력 = 재료 7종 + 재령 (log_age면 재령에 자연로그) → MinMaxScaler → MLP
+  function annStrength(model, mix, age) {
+    const x = MATERIALS.map((k) => mix[k]).concat([model.log_age ? Math.log(age) : age]);
+    const net = model.reg;
+    let h = x.map((v, i) => v * net.scale[i] + net.min[i]);
     const L = net.coefs.length;
     for (let l = 0; l < L; l++) {
       const W = net.coefs[l], b = net.intercepts[l], out = new Array(b.length);
@@ -45,7 +32,22 @@
     return h[0];
   }
 
-  function interp(x, xs, ys) { // numpy.interp와 같음 (양끝은 끝값으로 고정)
+  // 비교용 공식: Abrams 법칙(물-결합재비) × ACI 209 재령 계수 — 예측에는 쓰지 않음
+  function formula(model, mix, age) {
+    const binder = mix["시멘트"] + mix["고로슬래그"] + mix["플라이애시"];
+    const wb = mix["물"] / binder;
+    return { wb, wc: mix["물"] / mix["시멘트"], strength: model.formula.A / Math.pow(model.formula.B, wb) * ageFactor(age) / ageFactor(28) };
+  }
+
+  function sigmaOf(model, mu, age) {
+    if (model.chosen.startsWith("σ가변")) {
+      const c = model.sigma_var.coef;
+      return Math.max(model.sigma_var.min, (c[0] + c[1] * mu + c[2] * Math.log(age)) * Math.sqrt(Math.PI / 2));
+    }
+    return model.sigma;
+  }
+
+  function interp(x, xs, ys) { // numpy.interp와 같음
     if (x <= xs[0]) return ys[0];
     if (x >= xs[xs.length - 1]) return ys[ys.length - 1];
     let lo = 0, hi = xs.length - 1;
@@ -53,38 +55,21 @@
     return xs[hi] === xs[lo] ? ys[hi] : ys[lo] + (ys[hi] - ys[lo]) * (x - xs[lo]) / (xs[hi] - xs[lo]);
   }
 
-  function sigmaVar(model, mu, af) {
-    const c = model.sigma_var.coef;
-    return Math.max(model.sigma_var.min, (c[0] + c[1] * mu + c[2] * af) * Math.sqrt(Math.PI / 2));
-  }
-
   function strength(model, mix, age) {
-    const feat = features(mix, age, model);
-    const mu = mlp(model.reg, feat);
-    const sigma = model.chosen.startsWith("A2") ? sigmaVar(model, mu, feat["재령계수"]) : model.sigma;
-    return { feat, mu, sigma };
+    const mu = annStrength(model, mix, age);
+    const f = formula(model, mix, age);
+    return { mu, sigma: sigmaOf(model, mu, age), formula: f.strength, wb: f.wb, wc: f.wc };
   }
 
   function probability(model, mix, age, target) {
-    const { feat, mu, sigma } = strength(model, mix, age);
-    const m = model.chosen;
-    if (m.startsWith("A")) return 1 - normCdf((target - mu) / sigma);
-    if (!model.clf) throw new Error("이 모델 파일에는 분류 모델 가중치가 없습니다.");
-    const ts = model.t_train.filter((t) => t < target).concat([target]);
-    let p = 1;
-    for (const t of ts) { // 낮은 목표부터 누적 최솟값 → 목표가 높을수록 확률이 커지지 않음
-      let q = mlp(model.clf, { ...feat, "목표강도": t });
-      if (m.startsWith("B1")) q = expit(model.platt[0] * logit(q) + model.platt[1]);
-      else if (m.startsWith("B2")) q = interp(q, model.iso.x, model.iso.y);
-      p = Math.min(p, q);
-    }
+    const mu = annStrength(model, mix, age);
+    let p = 1 - normCdf((target - mu) / sigmaOf(model, mu, age));
+    if (model.chosen.endsWith("+보정") && model.iso) p = interp(p, model.iso.x, model.iso.y);
     return p;
   }
 
   function requiredStrength(fck, s) { // 시방서 배합강도 식으로 알려진 형태 (계수는 원문 확인 필요)
-    if (s === null || s === undefined || Number.isNaN(s)) {
-      return fck < 21 ? fck + 7.0 : (fck <= 35 ? fck + 8.5 : 1.1 * fck + 5.0);
-    }
+    if (s === null || s === undefined || Number.isNaN(s)) return fck < 21 ? fck + 7.0 : (fck <= 35 ? fck + 8.5 : 1.1 * fck + 5.0);
     return fck <= 35 ? Math.max(fck + 1.34 * s, (fck - 3.5) + 2.33 * s) : Math.max(fck + 1.34 * s, 0.9 * fck + 2.33 * s);
   }
 
@@ -104,15 +89,7 @@
     return out;
   }
 
-  function validate(model) {
-    const need = ["chosen", "formula", "sigma", "sigma_var", "reg", "ranges"];
-    const miss = need.filter((k) => !(k in model));
-    if (miss.length) throw new Error(`모델 파일에 ${miss.join(", ")} 항목이 없습니다.`);
-    if (model.chosen.startsWith("B") && !model.clf) throw new Error("선택 방법이 분류(B)인데 분류 모델 가중치가 없습니다.");
-    return true;
-  }
-
-  const api = { MATERIALS, features, mlp, strength, probability, requiredStrength, verdict, rangeWarnings, validate, normCdf, ageFactor };
+  const api = { MATERIALS, annStrength, formula, strength, probability, requiredStrength, verdict, rangeWarnings, normCdf };
   if (typeof module !== "undefined" && module.exports) module.exports = api;
   else root.ConcreteModel = api;
 })(typeof window !== "undefined" ? window : globalThis);
